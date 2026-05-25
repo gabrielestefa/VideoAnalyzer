@@ -13,6 +13,7 @@ scipy>=1.11.0,<2.0
 pandas>=2.0.0,<3.0
 
 # Audio Processing
+SpeechRecognition>=3.10.0
 moviepy>=1.0.3,<3.0
 
 # Machine Learning - Core
