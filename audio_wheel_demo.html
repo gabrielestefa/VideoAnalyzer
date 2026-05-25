@@ -1,0 +1,534 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Product Strategy Meeting - Audio Analysis</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: radial-gradient(ellipse at 20% 50%, #1a1a2e 0%, #0f0f1a 40%, #050510 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+            overflow-x: hidden;
+        }
+        
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: 
+                radial-gradient(ellipse at 80% 20%, rgba(59, 130, 246, 0.08) 0%, transparent 50%),
+                radial-gradient(ellipse at 20% 80%, rgba(139, 92, 246, 0.06) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: 0;
+        }
+        
+        .container {
+            position: relative;
+            z-index: 1;
+            display: grid;
+            grid-template-columns: 280px 1fr 340px;
+            min-height: 100vh;
+        }
+        
+        .info-panel {
+            padding: 32px 24px;
+            background: rgba(12, 12, 20, 0.95);
+            border-right: 1px solid rgba(255, 255, 255, 0.06);
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+        
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 32px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        
+        .brand-icon {
+            width: 32px;
+            height: 32px;
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .brand-icon svg { width: 18px; height: 18px; fill: #000; }
+        
+        .brand-text { font-size: 13px; color: #888; }
+        .brand-text strong { display: block; color: #fff; font-size: 14px; font-weight: 600; }
+        
+        .video-title { font-size: 22px; font-weight: 600; color: #fff; margin-bottom: 8px; line-height: 1.35; }
+        .video-meta { color: #666; font-size: 13px; margin-bottom: 24px; }
+        
+        .section-label {
+            color: #f59e0b;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            margin-bottom: 12px;
+            margin-top: 24px;
+        }
+        
+        .topics-list { display: flex; flex-direction: column; gap: 6px; flex: 1; }
+        
+        .topic-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            border: 1px solid transparent;
+        }
+        
+        .topic-item:hover { background: rgba(255, 255, 255, 0.06); }
+        .topic-item.hidden { opacity: 0.4; }
+        .topic-item.focused { border-color: rgba(255, 255, 255, 0.2); background: rgba(255, 255, 255, 0.08); }
+        
+        .topic-color { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+        .topic-name { flex: 1; font-size: 13px; color: #ccc; }
+        .topic-count { font-size: 11px; color: #666; background: rgba(255, 255, 255, 0.05); padding: 2px 8px; border-radius: 10px; }
+        
+        .topic-hint { font-size: 11px; color: #555; margin-top: 12px; line-height: 1.5; }
+        
+        .wheel-panel {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 40px 20px;
+        }
+        
+        .wheel-container { position: relative; }
+        
+        #wheelCanvas { cursor: grab; }
+        #wheelCanvas:active { cursor: grabbing; }
+        
+        .center-info { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; pointer-events: none; }
+        #currentTime { font-size: 20px; font-weight: 600; color: #4ecdc4; }
+        #totalDuration { font-size: 11px; color: #555; margin-top: 2px; }
+        
+        .player-bar {
+            margin-top: 32px;
+            background: rgba(20, 20, 35, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 12px;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            width: 100%;
+            max-width: 560px;
+        }
+        
+        .play-button {
+            width: 42px;
+            height: 42px;
+            background: #4ecdc4;
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+        }
+        
+        .play-button:hover { background: #45b8b0; transform: scale(1.04); }
+        .play-button svg { width: 16px; height: 16px; fill: #0a0a14; }
+        
+        .progress-container { flex: 1; display: flex; align-items: center; gap: 12px; }
+        .time-display { font-size: 12px; color: #666; font-family: 'SF Mono', 'Consolas', monospace; min-width: 42px; text-align: center; }
+        
+        .progress-bar { flex: 1; height: 4px; background: rgba(255, 255, 255, 0.1); border-radius: 2px; position: relative; cursor: pointer; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #4ecdc4 0%, #3db9b0 100%); border-radius: 2px; width: 0%; transition: width 0.1s linear; }
+        .progress-handle { position: absolute; top: 50%; transform: translate(-50%, -50%); width: 12px; height: 12px; background: #4ecdc4; border-radius: 50%; opacity: 0; transition: opacity 0.15s; }
+        .progress-bar:hover .progress-handle { opacity: 1; }
+        
+        .playback-controls { display: flex; align-items: center; gap: 8px; }
+        
+        .mode-toggle, .speed-control {
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #888;
+            padding: 6px 10px;
+            border-radius: 6px;
+            font-size: 11px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        
+        .mode-toggle:hover, .speed-control:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+        .mode-toggle.active { background: rgba(78, 205, 196, 0.15); border-color: #4ecdc4; color: #4ecdc4; }
+        
+        .sentences-panel {
+            padding: 24px 20px;
+            background: rgba(12, 12, 20, 0.95);
+            border-left: 1px solid rgba(255, 255, 255, 0.06);
+            overflow-y: auto;
+            max-height: 100vh;
+        }
+        
+        .search-container { margin-bottom: 20px; }
+        
+        .search-box {
+            display: flex;
+            align-items: center;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 8px;
+            padding: 10px 14px;
+            gap: 10px;
+        }
+        
+        .search-icon { width: 14px; height: 14px; opacity: 0.4; }
+        
+        #searchInput {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: #fff;
+            font-size: 13px;
+            outline: none;
+        }
+        
+        #searchInput::placeholder { color: #555; }
+        
+        .search-nav { display: flex; gap: 4px; align-items: center; }
+        .search-nav button {
+            width: 24px;
+            height: 24px;
+            background: rgba(255, 255, 255, 0.06);
+            border: none;
+            border-radius: 4px;
+            color: #666;
+            cursor: pointer;
+            font-size: 11px;
+            transition: all 0.15s;
+        }
+        .search-nav button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.12); color: #fff; }
+        .search-nav button:disabled { opacity: 0.3; cursor: not-allowed; }
+        #matchCounter { font-size: 11px; color: #555; margin-left: 6px; min-width: 30px; }
+        
+        .sentences-list { display: flex; flex-direction: column; gap: 8px; }
+        
+        .sentence-card {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            border-radius: 8px;
+            padding: 12px 14px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        
+        .sentence-card:hover { background: rgba(255, 255, 255, 0.04); border-color: rgba(255, 255, 255, 0.08); }
+        .sentence-card.selected { background: rgba(78, 205, 196, 0.08); border-color: rgba(78, 205, 196, 0.3); }
+        .sentence-card.match { border-left: 2px solid #f59e0b; }
+        .sentence-card.hidden { display: none; }
+        
+        .sentence-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+        .sentence-topic-dot { width: 6px; height: 6px; border-radius: 50%; }
+        .sentence-time { font-size: 11px; color: #4ecdc4; font-weight: 500; }
+        .sentence-text { font-size: 13px; color: #bbb; line-height: 1.5; }
+        
+        .sentences-panel::-webkit-scrollbar, .info-panel::-webkit-scrollbar { width: 4px; }
+        .sentences-panel::-webkit-scrollbar-thumb, .info-panel::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.08); border-radius: 2px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="info-panel">
+            <div class="brand">
+                <div class="brand-icon">
+                    <svg viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+                </div>
+                <div class="brand-text">
+                    <strong>Audio Analyzer</strong>
+                    Transcript Visualization
+                </div>
+            </div>
+            
+            <h1 class="video-title">Product Strategy Meeting</h1>
+            <div class="video-meta">4m 00s | 16 segments</div>
+            
+            <div class="section-label">Topics</div>
+            <div class="topics-list" id="topicsList"></div>
+            <div class="topic-hint">Click to hide/show. Double-click to focus.</div>
+        </div>
+        
+        <div class="wheel-panel">
+            <div class="wheel-container">
+                <canvas id="wheelCanvas" width="520" height="520"></canvas>
+                <div class="center-info">
+                    <div id="currentTime">00:00</div>
+                    <div id="totalDuration">4m 00s</div>
+                </div>
+            </div>
+            
+            <div class="player-bar">
+                <button class="play-button" id="playBtn">
+                    <svg viewBox="0 0 24 24" id="playIcon"><path d="M8 5v14l11-7z"/></svg>
+                </button>
+                <div class="progress-container">
+                    <span class="time-display" id="elapsedTime">00:00</span>
+                    <div class="progress-bar" id="progressBar">
+                        <div class="progress-fill" id="progressFill"></div>
+                        <div class="progress-handle" id="progressHandle" style="left: 0%"></div>
+                    </div>
+                    <span class="time-display" id="remainingTime">04:00</span>
+                </div>
+                <div class="playback-controls">
+                    <button class="mode-toggle" id="modeToggle">Segment</button>
+                    <button class="speed-control" id="speedBtn">1x</button>
+                </div>
+            </div>
+        </div>
+        
+        <div class="sentences-panel">
+            <div class="search-container">
+                <div class="search-box">
+                    <svg class="search-icon" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>
+                    </svg>
+                    <input type="text" id="searchInput" placeholder="Search transcript..." />
+                    <div class="search-nav">
+                        <button id="prevBtn">&#8593;</button>
+                        <button id="nextBtn">&#8595;</button>
+                        <span id="matchCounter"></span>
+                    </div>
+                </div>
+            </div>
+            <div class="sentences-list" id="sentencesList"></div>
+        </div>
+    </div>
+    
+    <script>
+        const sentences = [{"id": 0, "start": 0.5, "end": 12.0, "text": "Today we're discussing the architecture of our new product platform and the key design decisions that will shape its future.", "topic": "Architecture"}, {"id": 1, "start": 12.5, "end": 24.0, "text": "The microservices approach allows us to scale individual components independently while maintaining system reliability.", "topic": "Architecture"}, {"id": 2, "start": 24.5, "end": 38.0, "text": "User research indicates that our target audience prioritizes speed and simplicity over feature richness.", "topic": "User Research"}, {"id": 3, "start": 38.5, "end": 52.0, "text": "We conducted interviews with fifteen enterprise customers to understand their workflow requirements.", "topic": "User Research"}, {"id": 4, "start": 52.5, "end": 66.0, "text": "The authentication system needs to support both OAuth and SAML for enterprise single sign-on requirements.", "topic": "Security"}, {"id": 5, "start": 66.5, "end": 80.0, "text": "Data encryption at rest and in transit is a mandatory requirement for compliance.", "topic": "Security"}, {"id": 6, "start": 80.5, "end": 94.0, "text": "The dashboard interface should follow our established design system with the new color palette.", "topic": "Design"}, {"id": 7, "start": 94.5, "end": 108.0, "text": "We're introducing dark mode support across all interfaces based on user feedback.", "topic": "Design"}, {"id": 8, "start": 108.5, "end": 122.0, "text": "Performance benchmarks show a forty percent improvement in page load times with the new caching strategy.", "topic": "Performance"}, {"id": 9, "start": 122.5, "end": 136.0, "text": "Database query optimization reduced average response time from two hundred to fifty milliseconds.", "topic": "Performance"}, {"id": 10, "start": 136.5, "end": 150.0, "text": "The roadmap includes three major releases planned for the next fiscal year.", "topic": "Roadmap"}, {"id": 11, "start": 150.5, "end": 164.0, "text": "Phase one focuses on core functionality while phase two introduces advanced analytics.", "topic": "Roadmap"}, {"id": 12, "start": 164.5, "end": 178.0, "text": "Integration with third-party services requires careful API versioning strategy.", "topic": "Architecture"}, {"id": 13, "start": 178.5, "end": 192.0, "text": "We need to establish clear data retention policies in coordination with the legal team.", "topic": "Security"}, {"id": 14, "start": 192.5, "end": 206.0, "text": "The mobile experience should mirror desktop functionality with optimized touch interactions.", "topic": "Design"}, {"id": 15, "start": 206.5, "end": 220.0, "text": "Load testing revealed the system can handle ten thousand concurrent users without degradation.", "topic": "Performance"}];
+        const topicColors = {"Architecture": "#3b82f6", "User Research": "#f59e0b", "Security": "#e74c3c", "Design": "#8b5cf6", "Performance": "#10b981", "Roadmap": "#ec4899"};
+        const totalDuration = 240.0;
+        
+        let currentRotation = 0, selectedSentence = null, searchMatches = [], currentMatchIndex = -1;
+        let isDragging = false, lastMouseAngle = 0, hiddenTopics = new Set(), focusedTopic = null;
+        
+        const canvas = document.getElementById('wheelCanvas');
+        const ctx = canvas.getContext('2d');
+        const centerX = canvas.width / 2, centerY = canvas.height / 2;
+        const outerRadius = 220, innerRadius = 100;
+        
+        function formatTime(s) {
+            const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+            return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
+        }
+        
+        function buildTopicsList() {
+            const counts = {};
+            sentences.forEach(s => counts[s.topic] = (counts[s.topic] || 0) + 1);
+            
+            const list = document.getElementById('topicsList');
+            list.innerHTML = '';
+            Object.keys(topicColors).forEach(topic => {
+                const item = document.createElement('div');
+                item.className = 'topic-item';
+                item.dataset.topic = topic;
+                item.innerHTML = `<div class="topic-color" style="background:${topicColors[topic]}"></div><span class="topic-name">${topic}</span><span class="topic-count">${counts[topic] || 0}</span>`;
+                
+                item.addEventListener('click', e => {
+                    if (e.detail === 1) setTimeout(() => { if (e.detail === 1) toggleTopic(topic); }, 200);
+                });
+                item.addEventListener('dblclick', () => focusTopic(topic));
+                list.appendChild(item);
+            });
+        }
+        
+        function toggleTopic(topic) {
+            if (focusedTopic) { focusedTopic = null; hiddenTopics.clear(); }
+            hiddenTopics.has(topic) ? hiddenTopics.delete(topic) : hiddenTopics.add(topic);
+            updateVisibility();
+        }
+        
+        function focusTopic(topic) {
+            if (focusedTopic === topic) { focusedTopic = null; hiddenTopics.clear(); }
+            else {
+                focusedTopic = topic;
+                hiddenTopics.clear();
+                Object.keys(topicColors).forEach(t => { if (t !== topic) hiddenTopics.add(t); });
+            }
+            updateVisibility();
+        }
+        
+        function updateVisibility() {
+            document.querySelectorAll('.topic-item').forEach(item => {
+                const t = item.dataset.topic;
+                item.classList.toggle('hidden', hiddenTopics.has(t));
+                item.classList.toggle('focused', focusedTopic === t);
+            });
+            document.querySelectorAll('.sentence-card').forEach(card => {
+                const s = sentences[parseInt(card.dataset.index)];
+                card.classList.toggle('hidden', hiddenTopics.has(s.topic));
+            });
+            drawWheel();
+        }
+        
+        function buildSentenceCards() {
+            const list = document.getElementById('sentencesList');
+            list.innerHTML = '';
+            sentences.forEach((s, i) => {
+                const card = document.createElement('div');
+                card.className = 'sentence-card';
+                card.dataset.index = i;
+                card.innerHTML = `<div class="sentence-header"><div class="sentence-topic-dot" style="background:${topicColors[s.topic]}"></div><span class="sentence-time">${formatTime(s.start)}</span></div><div class="sentence-text">${s.text}</div>`;
+                card.addEventListener('click', () => selectSentence(i));
+                list.appendChild(card);
+            });
+        }
+        
+        function drawWheel() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.translate(centerX, centerY);
+            
+            ctx.beginPath();
+            ctx.arc(0, 0, outerRadius + 12, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+            ctx.stroke();
+            
+            for (let i = 0; i < 12; i++) {
+                const angle = (i / 12) * Math.PI * 2 - Math.PI / 2 + currentRotation;
+                const x = Math.cos(angle) * (outerRadius + 28);
+                const y = Math.sin(angle) * (outerRadius + 28);
+                ctx.fillStyle = 'rgba(255,255,255,0.3)';
+                ctx.font = '10px Inter';
+                ctx.textAlign = 'center';
+                ctx.fillText(formatTime((i / 12) * totalDuration), x, y);
+            }
+            ctx.restore();
+            
+            sentences.forEach((s, i) => {
+                if (hiddenTopics.has(s.topic)) return;
+                const startAngle = (s.start / totalDuration) * Math.PI * 2 - Math.PI / 2 + currentRotation;
+                const endAngle = (s.end / totalDuration) * Math.PI * 2 - Math.PI / 2 + currentRotation;
+                const midAngle = (startAngle + endAngle) / 2;
+                const r = outerRadius - 15 - (i % 4) * 12;
+                const x = centerX + Math.cos(midAngle) * r;
+                const y = centerY + Math.sin(midAngle) * r;
+                const color = topicColors[s.topic];
+                let size = 5, opacity = 0.7;
+                
+                if (searchMatches.includes(i)) { size = 7; opacity = 1; }
+                if (selectedSentence === i) {
+                    size = 9; opacity = 1;
+                    ctx.beginPath();
+                    ctx.arc(x, y, size + 6, 0, Math.PI * 2);
+                    ctx.fillStyle = color + '33';
+                    ctx.fill();
+                }
+                
+                ctx.beginPath();
+                ctx.arc(x, y, size, 0, Math.PI * 2);
+                ctx.globalAlpha = opacity;
+                ctx.fillStyle = color;
+                ctx.fill();
+                ctx.globalAlpha = 1;
+                
+                ctx.beginPath();
+                ctx.arc(centerX, centerY, r, startAngle, endAngle);
+                ctx.strokeStyle = selectedSentence === i ? color : color + '50';
+                ctx.lineWidth = selectedSentence === i ? 2 : 1;
+                ctx.stroke();
+            });
+            
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, innerRadius - 8, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(10,10,20,0.95)';
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(78,205,196,0.2)';
+            ctx.stroke();
+        }
+        
+        function selectSentence(i) {
+            selectedSentence = i;
+            document.querySelectorAll('.sentence-card').forEach((c, j) => c.classList.toggle('selected', j === i));
+            document.querySelector(`.sentence-card[data-index="${i}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            drawWheel();
+        }
+        
+        canvas.addEventListener('click', e => {
+            const rect = canvas.getBoundingClientRect();
+            const dx = e.clientX - rect.left - centerX;
+            const dy = e.clientY - rect.top - centerY;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            if (dist >= innerRadius && dist <= outerRadius + 15) {
+                const angle = Math.atan2(dy, dx) + Math.PI/2 - currentRotation;
+                const time = (((angle % (Math.PI*2)) + Math.PI*2) % (Math.PI*2)) / (Math.PI*2) * totalDuration;
+                let closest = 0, minDist = Infinity;
+                sentences.forEach((s, i) => {
+                    if (hiddenTopics.has(s.topic)) return;
+                    const d = Math.abs(time - (s.start + s.end) / 2);
+                    if (d < minDist) { minDist = d; closest = i; }
+                });
+                selectSentence(closest);
+            }
+        });
+        
+        canvas.addEventListener('mousedown', e => {
+            const rect = canvas.getBoundingClientRect();
+            lastMouseAngle = Math.atan2(e.clientY - rect.top - centerY, e.clientX - rect.left - centerX);
+            isDragging = true;
+        });
+        canvas.addEventListener('mousemove', e => {
+            if (!isDragging) return;
+            const rect = canvas.getBoundingClientRect();
+            const angle = Math.atan2(e.clientY - rect.top - centerY, e.clientX - rect.left - centerX);
+            currentRotation += angle - lastMouseAngle;
+            lastMouseAngle = angle;
+            drawWheel();
+        });
+        canvas.addEventListener('mouseup', () => isDragging = false);
+        canvas.addEventListener('mouseleave', () => isDragging = false);
+        canvas.addEventListener('wheel', e => { e.preventDefault(); currentRotation += e.deltaY * 0.002; drawWheel(); });
+        
+        document.getElementById('searchInput').addEventListener('input', function() {
+            const q = this.value.toLowerCase().trim();
+            searchMatches = [];
+            if (q) sentences.forEach((s, i) => { if (s.text.toLowerCase().includes(q) && !hiddenTopics.has(s.topic)) searchMatches.push(i); });
+            document.querySelectorAll('.sentence-card').forEach((c, i) => c.classList.toggle('match', searchMatches.includes(i)));
+            document.getElementById('matchCounter').textContent = searchMatches.length || '';
+            document.getElementById('prevBtn').disabled = document.getElementById('nextBtn').disabled = !searchMatches.length;
+            drawWheel();
+        });
+        
+        document.getElementById('prevBtn').addEventListener('click', () => {
+            if (!searchMatches.length) return;
+            currentMatchIndex = currentMatchIndex <= 0 ? searchMatches.length - 1 : currentMatchIndex - 1;
+            selectSentence(searchMatches[currentMatchIndex]);
+            document.getElementById('matchCounter').textContent = `${currentMatchIndex+1}/${searchMatches.length}`;
+        });
+        document.getElementById('nextBtn').addEventListener('click', () => {
+            if (!searchMatches.length) return;
+            currentMatchIndex = currentMatchIndex >= searchMatches.length - 1 ? 0 : currentMatchIndex + 1;
+            selectSentence(searchMatches[currentMatchIndex]);
+            document.getElementById('matchCounter').textContent = `${currentMatchIndex+1}/${searchMatches.length}`;
+        });
+        
+        buildTopicsList();
+        buildSentenceCards();
+        drawWheel();
+    </script>
+</body>
+</html>
