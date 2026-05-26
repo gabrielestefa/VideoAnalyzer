@@ -3744,17 +3744,19 @@ class ModernHandTrackerApp(ctk.CTk):
                         try:
                             updated_transcript = []
                             
-                            # Iterate transcript and match with topic assignments using the same filter
-                            for start, end, text, _ in engine.transcript:
+                            # Iterate transcript and match with topic assignments using the same filter.
+                            # Transcript tuples may be 4 elements (legacy) or 5 (with sentiment_score).
+                            for entry in engine.transcript:
+                                if len(entry) < 3:
+                                    continue
+                                start, end, text = entry[0], entry[1], entry[2]
                                 topic_label = "General"  # Default
-                                
+
                                 # Check if this segment was included in topic modeling
                                 if text and len(text) > 10:
-                                    # It was included, so grab the next topic from the list
                                     if global_filtered_idx < len(assigned_topic_ids):
                                         topic_id = assigned_topic_ids[global_filtered_idx]
-                                        
-                                        # Resolve label
+
                                         if topic_label_map and topic_id in topic_label_map:
                                             topic_label = topic_label_map[topic_id]
                                         elif 0 <= topic_id < len(topic_labels_list):
@@ -3763,9 +3765,9 @@ class ModernHandTrackerApp(ctk.CTk):
                                             topic_label = "General"
                                         else:
                                             topic_label = f"Topic {topic_id}"
-                                            
+
                                         global_filtered_idx += 1
-                                
+
                                 updated_transcript.append((start, end, text, topic_label))
                                 
                             # Get video title from path
