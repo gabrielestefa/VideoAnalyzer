@@ -1,6 +1,6 @@
 # Core Computer Vision & UI
 opencv-python>=4.8.0,<5.0
-mediapipe>=0.10.0,<0.11
+mediapipe>=0.10.0,<0.12
 customtkinter>=5.2.0,<6.0
 Pillow>=10.0.0,<12.0
 numpy>=1.24.0,<3.0
@@ -26,8 +26,10 @@ sentence-transformers>=2.2.0,<4.0
 hdbscan>=0.8.33,<0.9
 
 # LLM & Transformers (GPU-accelerated)
-# NOTE: Install PyTorch with CUDA separately for GPU support:
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# NOTE: PyTorch is NOT listed here because the CUDA variant must be installed
+# separately to match your GPU driver.  Run this BEFORE setup.bat (or after
+# activating .venv) for an RTX 40/50-series card with CUDA 12.x:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 transformers>=4.35.0,<5.0
 sentencepiece>=0.1.99,<0.3
 accelerate>=0.25.0,<2.0
@@ -39,3 +41,7 @@ datamapplot>=0.4.0,<1.0
 # Speech Recognition (GPU-accelerated)
 openai-whisper>=20231117
 faster-whisper>=1.0.0,<2.0
+# NOTE: hf_xet intentionally NOT included — its chunked transfer protocol
+# downloads in 16-64 MiB bursts (jumpy progress) and doesn't support
+# byte-level resume after interruption. Plain HTTPS is slower but smoother
+# and resumable, which matters more for a one-time 3 GB model download.

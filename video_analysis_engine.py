@@ -291,70 +291,16 @@ class VideoAnalysisEngine:
 
             self.transcript = []
 
-            # Try faster-whisper (Multiprocessing)
+            # Try faster-whisper (chunk-based persistent worker)
             if FASTER_WHISPER_AVAILABLE:
                 if progress_callback:
-                    progress_callback(15, "Starting transcription process...")
-
-                msg_queue = multiprocessing.Queue()
-                p = multiprocessing.Process(target=_worker_whisper_transcribe, args=(temp_audio, "large-v3", msg_queue))
-                p.start()
-
-                # Drain the queue WHILE the process runs — calling p.join() first
-                # would deadlock if the worker fills the OS pipe buffer before we read.
-                # Stall guard: if no progress in MAX_STALL_SECONDS, terminate worker.
-                import queue as _queue_mod
-                MAX_STALL_SECONDS = 60 * 60  # 1h hard limit; reasonable for huge files
-                last_progress_time = time.time()
-                last_progress_percent = 15
-
-                while True:
-                    try:
-                        msg = msg_queue.get(timeout=0.1)
-                        if msg[0] == "progress":
-                            last_progress_time = time.time()
-                            last_progress_percent = msg[1]
-                            if progress_callback:
-                                progress_callback(msg[1], msg[2])
-                        elif msg[0] == "result":
-                            self.transcript = msg[1]
-                        elif msg[0] == "error":
-                            logging.warning("Transcription worker error: %s", msg[1])
-                            self.transcript = []
-                    except _queue_mod.Empty:
-                        if not p.is_alive():
-                            break
-                        if time.time() - last_progress_time > MAX_STALL_SECONDS:
-                            logging.error("Transcription worker stalled for %ds; terminating",
-                                          MAX_STALL_SECONDS)
-                            if progress_callback:
-                                progress_callback(last_progress_percent,
-                                                  "Transcription stalled; terminating worker...")
-                            p.terminate()
-                            p.join(timeout=5)
-                            if p.is_alive():
-                                p.kill()
-                            break
-
-                p.join(timeout=5)
-                if p.is_alive():
-                    logging.error("Transcription worker did not exit cleanly; killing process")
-                    p.kill()
-                    p.join()
-
-                # Final drain for any messages that arrived in the last window
-                while not msg_queue.empty():
-                    try:
-                        msg = msg_queue.get_nowait()
-                        if msg[0] == "result":
-                            self.transcript = msg[1]
-                        elif msg[0] == "error":
-                            logging.warning("Transcription worker error: %s", msg[1])
-                    except Exception:
-                        break
-
-                if self.transcript:
-                    logging.info("[faster-whisper] Transcribed %d sentences", len(self.transcript))
+                    progress_callback(15, "Starting Whisper transcription...")
+                segments = self._run_chunked_transcription(temp_audio, duration, progress_callback)
+                if segments:
+                    self.transcript = segments
+                    logging.info("[faster-whisper] Transcribed %d segments", len(self.transcript))
+                    if progress_callback: progress_callback(85, "Classifying sentiment...")
+                    self.classify_segment_sentiments()
                     if progress_callback: progress_callback(95, "Generating summary...")
                     self.generate_summary()
                     if progress_callback: progress_callback(100, "Transcription complete")
@@ -412,6 +358,265 @@ class VideoAnalysisEngine:
                 os.remove(temp_audio)
         logging.debug("transcribe_audio finished")
 
+    def _extract_audio_chunk(self, source_audio_path, chunk_start, chunk_end, output_path):
+        """Extract [chunk_start, chunk_end] from source_audio_path into a 16 kHz mono WAV.
+
+        Uses ffmpeg directly (10-100x faster than moviepy's Python audio loop).
+        ffmpeg is always available because moviepy depends on imageio-ffmpeg.
+        Falls back to moviepy only if ffmpeg lookup fails for any reason.
+        """
+        duration = max(0.001, chunk_end - chunk_start)
+        try:
+            from imageio_ffmpeg import get_ffmpeg_exe
+            ffmpeg = get_ffmpeg_exe()
+            import subprocess as _sp
+            # -ss before -i = fast seek; -ac 1 = mono; -ar 16000 = 16 kHz
+            _sp.run(
+                [ffmpeg, "-y", "-loglevel", "error",
+                 "-ss", str(chunk_start), "-t", str(duration),
+                 "-i", source_audio_path,
+                 "-ac", "1", "-ar", "16000",
+                 "-c:a", "pcm_s16le", output_path],
+                check=True, capture_output=True,
+            )
+            return
+        except Exception as ffmpeg_err:
+            logging.warning("ffmpeg extraction failed (%s); falling back to moviepy",
+                            ffmpeg_err)
+
+        try:
+            from moviepy import AudioFileClip
+        except ImportError:
+            from moviepy.editor import AudioFileClip
+        clip = AudioFileClip(source_audio_path)
+        end = min(chunk_end, clip.duration)
+        sub = clip.subclipped(chunk_start, end)
+        sub.write_audiofile(output_path, fps=16000, nbytes=2, codec="pcm_s16le",
+                            logger=None)
+        sub.close()
+        clip.close()
+
+    def _run_chunked_transcription(self, temp_audio, duration, progress_callback=None):
+        """
+        Transcribes temp_audio using a persistent Whisper worker that loads the model once.
+        Audio is split into 5-minute chunks with 2-second overlap to avoid boundary cuts.
+        If the worker stalls or crashes, it is restarted and the failed chunk is retried once.
+        Completed chunk results are accumulated in self.transcript as each chunk finishes,
+        so partial transcripts are preserved even if later chunks fail.
+        Returns the full list of (start, end, text, label) tuples.
+        """
+        import queue as _queue_mod, tempfile as _tempfile
+
+        CHUNK_SECONDS = 300          # 5-minute chunks
+        OVERLAP_SECONDS = 2          # overlap on each side to avoid cutting sentences
+        STALL_SECONDS = 600          # kill worker if no message for 10 minutes
+        MAX_RETRIES = 1              # retry a failed/stalled chunk once
+
+        num_chunks = max(1, math.ceil(duration / CHUNK_SECONDS))
+        completed_segments = []
+        worker_proc = None
+        cmd_q = res_q = None
+
+        def _spawn():
+            nonlocal worker_proc, cmd_q, res_q
+            # Shut down existing worker if alive
+            if worker_proc and worker_proc.is_alive():
+                try: cmd_q.put_nowait(("shutdown",))
+                except Exception: pass
+                worker_proc.join(timeout=5)
+                if worker_proc.is_alive():
+                    worker_proc.kill(); worker_proc.join()
+            cmd_q = multiprocessing.Queue()
+            res_q = multiprocessing.Queue()
+            worker_proc = multiprocessing.Process(
+                target=_persistent_whisper_worker,
+                args=("large-v3", cmd_q, res_q),
+                daemon=True,
+            )
+            worker_proc.start()
+            # Wait for "ready". Deadline resets on every message so that long
+            # but actively-progressing operations (e.g. first-run download of
+            # the 3 GB large-v3 model) don't get killed. The worker emits a
+            # heartbeat every 10s during the download to keep this loop alive.
+            SILENCE_TIMEOUT = 120  # seconds with no message → assume dead
+            deadline = time.time() + SILENCE_TIMEOUT
+            while True:
+                if not worker_proc.is_alive():
+                    logging.error("Whisper worker died before signalling ready")
+                    return False
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    logging.error("Whisper worker silent for %ds; terminating",
+                                  SILENCE_TIMEOUT)
+                    if worker_proc.is_alive():
+                        worker_proc.terminate(); worker_proc.join()
+                    return False
+                try:
+                    msg = res_q.get(timeout=min(remaining, 1.0))
+                except _queue_mod.Empty:
+                    continue
+                # Any message → worker is alive, reset the silence window
+                deadline = time.time() + SILENCE_TIMEOUT
+                if msg[0] == "ready":
+                    return True
+                if msg[0] == "fatal_error":
+                    logging.error("Whisper worker failed to start: %s", msg[1])
+                    worker_proc.terminate(); worker_proc.join()
+                    return False
+                if msg[0] == "progress" and progress_callback:
+                    progress_callback(msg[1], msg[2])
+
+        if not _spawn():
+            return completed_segments
+
+        # ETA tracking — wall time of each completed chunk
+        chunk_durations: list[float] = []
+
+        def _fmt_eta(seconds: float) -> str:
+            seconds = int(max(0, seconds))
+            if seconds < 60:
+                return f"{seconds}s"
+            if seconds < 3600:
+                return f"{seconds // 60}m {seconds % 60}s"
+            return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+        def _eta_text(idx_done: int) -> str:
+            """Return ' — ETA Xm Ys' string, or '' before we have any data."""
+            if not chunk_durations:
+                return ""
+            avg = sum(chunk_durations) / len(chunk_durations)
+            remaining = (num_chunks - idx_done) * avg
+            return f" — ETA {_fmt_eta(remaining)}"
+
+        for chunk_index in range(num_chunks):
+            chunk_start = chunk_index * CHUNK_SECONDS
+            chunk_end = min(chunk_start + CHUNK_SECONDS, duration)
+            # Extend extraction window by OVERLAP_SECONDS on both sides
+            extract_start = max(0.0, chunk_start - OVERLAP_SECONDS)
+            extract_end = min(duration, chunk_end + OVERLAP_SECONDS)
+            pct_start = 15 + int((chunk_index / num_chunks) * 70)
+            pct_end = 15 + int(((chunk_index + 1) / num_chunks) * 70)
+
+            chunk_audio = os.path.join(
+                _tempfile.gettempdir(),
+                f"whisper_chunk_{os.getpid()}_{chunk_index}.wav",
+            )
+            chunk_t0 = time.time()
+            try:
+                if progress_callback:
+                    progress_callback(pct_start,
+                                      f"Extracting chunk {chunk_index+1}/{num_chunks}"
+                                      f"{_eta_text(chunk_index)}")
+                self._extract_audio_chunk(temp_audio, extract_start, extract_end, chunk_audio)
+            except Exception as e:
+                logging.error("Chunk %d audio extraction failed: %s", chunk_index, e)
+                continue
+
+            success = False
+            for attempt in range(MAX_RETRIES + 1):
+                if attempt > 0:
+                    # Re-spawn only if worker is dead; otherwise just retry
+                    if not worker_proc.is_alive():
+                        logging.info("Respawning worker for chunk %d retry", chunk_index)
+                        if not _spawn():
+                            logging.error("Worker restart failed; aborting transcription")
+                            try: os.remove(chunk_audio)
+                            except OSError: pass
+                            return completed_segments
+                    if progress_callback:
+                        progress_callback(pct_start,
+                                          f"Retrying chunk {chunk_index+1}/{num_chunks}...")
+
+                cmd_q.put(("chunk", chunk_audio, chunk_start))
+                last_activity = time.time()
+                worker_failed = False
+
+                while True:
+                    try:
+                        msg = res_q.get(timeout=0.2)
+                        last_activity = time.time()
+
+                        if msg[0] == "progress":
+                            pct = pct_start + int((msg[1] / 100.0) * (pct_end - pct_start))
+                            if progress_callback:
+                                progress_callback(pct,
+                                                  f"[{chunk_index+1}/{num_chunks}] {msg[2]}"
+                                                  f"{_eta_text(chunk_index)}")
+
+                        elif msg[0] == "chunk_result":
+                            # Strip overlap regions from both sides before appending
+                            filtered = [s for s in msg[2]
+                                        if s[1] > chunk_start and s[0] < chunk_end]
+                            completed_segments.extend(filtered)
+                            self.transcript = list(completed_segments)
+                            success = True
+                            break
+
+                        elif msg[0] == "chunk_error":
+                            logging.warning("Chunk %d error (attempt %d): %s",
+                                            chunk_index, attempt + 1, msg[2])
+                            break
+
+                        elif msg[0] == "fatal_error":
+                            logging.error("Worker fatal on chunk %d: %s", chunk_index, msg[1])
+                            worker_failed = True
+                            break
+
+                    except _queue_mod.Empty:
+                        if not worker_proc.is_alive():
+                            logging.error("Worker died on chunk %d (attempt %d)",
+                                          chunk_index, attempt + 1)
+                            worker_failed = True
+                            break
+                        if time.time() - last_activity > STALL_SECONDS:
+                            logging.error("Worker stalled on chunk %d; terminating", chunk_index)
+                            if progress_callback:
+                                progress_callback(
+                                    pct_start,
+                                    f"Chunk {chunk_index+1} stalled; restarting worker...")
+                            worker_proc.terminate()
+                            worker_proc.join(timeout=5)
+                            if worker_proc.is_alive():
+                                worker_proc.kill(); worker_proc.join()
+                            worker_failed = True
+                            break
+
+                if success:
+                    break
+                # On worker_failed with retries left, the next iteration will re-spawn.
+                # On chunk_error the worker is still alive; just retry the send.
+
+            try: os.remove(chunk_audio)
+            except OSError: pass
+
+            if success:
+                chunk_durations.append(time.time() - chunk_t0)
+                # Keep ETA responsive to recent speed — average last 5 chunks only
+                if len(chunk_durations) > 5:
+                    chunk_durations.pop(0)
+                if progress_callback:
+                    progress_callback(
+                        pct_end,
+                        f"Chunk {chunk_index+1}/{num_chunks} done "
+                        f"({len(completed_segments)} segments so far)"
+                        f"{_eta_text(chunk_index + 1)}")
+            else:
+                logging.warning("Chunk %d/%d failed after %d attempt(s); skipping",
+                                chunk_index + 1, num_chunks, MAX_RETRIES + 1)
+                # Ensure worker is alive for the next chunk
+                if not worker_proc.is_alive():
+                    if not _spawn():
+                        return completed_segments
+
+        # Shut down worker cleanly
+        if worker_proc and worker_proc.is_alive():
+            try: cmd_q.put(("shutdown",))
+            except Exception: pass
+            worker_proc.join(timeout=10)
+            if worker_proc.is_alive():
+                worker_proc.kill(); worker_proc.join()
+
+        return completed_segments
 
     def classify_segment_sentiments(self, model_name: str = "cardiffnlp/twitter-roberta-base-sentiment-latest"):
         """
@@ -1139,7 +1344,49 @@ class VideoAnalysisEngine:
         from audio_wheel_analyzer import generate_audio_wheel_html
         return generate_audio_wheel_html(self.video_path, self.transcript, output_dir)
 
-# --- Multiprocessing Worker ---
+# --- Shared word-aggregation helper (used by both worker functions) ---
+def _aggregate_words_to_sentences(all_words, time_offset=0.0):
+    """Convert flat faster-whisper word objects into (start, end, text, label) tuples."""
+    transcript_result = []
+    current_sentence_words = []
+    sentence_start = 0.0
+
+    for i, word_data in enumerate(all_words):
+        word_text = word_data.word.strip()
+        t_start = word_data.start + time_offset
+        t_end = word_data.end + time_offset
+
+        if not word_text:
+            continue
+
+        if not current_sentence_words:
+            sentence_start = t_start
+
+        current_sentence_words.append(word_text)
+
+        ends_sentence = word_text.endswith(('.', '!', '?'))
+
+        has_long_gap = False
+        if i < len(all_words) - 1:
+            if (all_words[i + 1].start + time_offset) - t_end > 1.0:
+                has_long_gap = True
+
+        current_len = sum(len(w) + 1 for w in current_sentence_words)
+        should_split = (
+            ends_sentence
+            or (has_long_gap and current_len > 30)
+            or current_len > 250
+        )
+
+        if should_split or i == len(all_words) - 1:
+            transcript_result.append((sentence_start, t_end, " ".join(current_sentence_words), "Neutral"))
+            current_sentence_words = []
+            sentence_start = 0.0
+
+    return transcript_result
+
+
+# --- Legacy single-shot worker (kept for reference; superseded by persistent worker) ---
 def _worker_whisper_transcribe(audio_path, model_size, queue):
     """
     Independent worker function to run faster-whisper in a separate process.
@@ -1213,51 +1460,7 @@ def _worker_whisper_transcribe(audio_path, model_size, queue):
                  queue.put(("progress", prog, f"Transcribing... {int(current_time)}s / {int(total_duration)}s"))
 
         queue.put(("progress", 90, f"Aggregating {len(all_words)} words..."))
-
-        # Reconstruct sentences
-        transcript_result = []
-        current_sentence_words = []
-        sentence_start = 0.0
-        
-        for i, word_data in enumerate(all_words):
-            word_text = word_data.word.strip()
-            t_start = word_data.start
-            t_end = word_data.end
-            
-            if not word_text: continue
-                
-            if not current_sentence_words:
-                sentence_start = t_start
-            
-            current_sentence_words.append(word_text)
-            
-            # Split logic
-            ends_sentence = word_text.endswith(('.', '!', '?'))
-            
-            has_long_gap = False
-            if i < len(all_words) - 1:
-                next_start = all_words[i+1].start
-                if next_start - t_end > 1.0: # Reduced from 2.0
-                    has_long_gap = True
-            
-            current_len = sum(len(w) + 1 for w in current_sentence_words)
-            is_too_long = current_len > 250
-            
-            should_split = False
-            if ends_sentence: 
-                should_split = True
-            elif has_long_gap and current_len > 30: 
-                should_split = True
-            elif is_too_long: 
-                should_split = True # Force split if too long
-                
-            if should_split or i == len(all_words) - 1:
-                final_text = " ".join(current_sentence_words)
-                transcript_result.append((sentence_start, t_end, final_text, "Neutral"))
-                current_sentence_words = []
-                sentence_start = 0.0
-        
-        # Done!
+        transcript_result = _aggregate_words_to_sentences(all_words)
         queue.put(("result", transcript_result))
         
         # Explicit cleanup (safe here because process will exit)
@@ -1270,5 +1473,134 @@ def _worker_whisper_transcribe(audio_path, model_size, queue):
         import traceback
         traceback.print_exc()
         queue.put(("error", str(e)))
+
+
+# --- Persistent chunk worker ---
+def _persistent_whisper_worker(model_size, cmd_queue, res_queue):
+    """
+    Loads the Whisper model once then processes chunk commands until shutdown.
+    Receives: ("chunk", path, start_offset_seconds) | ("shutdown",)
+    Sends:    ("ready",) | ("progress", pct, msg) | ("chunk_result", start, segments)
+              | ("chunk_error", start, msg) | ("fatal_error", msg)
+    Worker survives individual chunk errors so the parent doesn't have to restart it.
+    """
+    try:
+        import torch, gc
+        from faster_whisper import WhisperModel
+        try:
+            from faster_whisper import BatchedInferencePipeline
+        except ImportError:
+            BatchedInferencePipeline = None
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type = "float16" if device == "cuda" else "int8"
+
+        res_queue.put(("progress", 5, f"Loading Whisper '{model_size}' on {device}..."))
+
+        # The first launch may download ~3 GB of weights with no API feedback.
+        # Run a background heartbeat so the parent's silence-timeout doesn't
+        # kill us mid-download. The heartbeat scans the HuggingFace cache to
+        # report actual download progress (MiB and %).
+        import threading, glob
+        load_done = threading.Event()
+
+        # Approximate total sizes (MiB) — used for % calculation only.
+        EXPECTED_MIB = {"large-v3": 3090, "large-v2": 3090, "large": 3090,
+                        "medium": 1530, "small": 484, "base": 145, "tiny": 75}
+        expected = EXPECTED_MIB.get(model_size, 3090)
+
+        # HF cache layout: ~/.cache/huggingface/hub/models--<org>--<name>/blobs/*
+        hf_hub = os.path.join(os.path.expanduser("~"), ".cache",
+                              "huggingface", "hub")
+
+        def _current_download_mib():
+            """Return MiB of the largest in-flight blob, or None if nothing found."""
+            try:
+                pattern = os.path.join(hf_hub, "models--*whisper*", "blobs", "*")
+                files = glob.glob(pattern)
+                if not files:
+                    return None
+                largest = max(files, key=lambda p: os.path.getsize(p))
+                return os.path.getsize(largest) / (1024 * 1024)
+            except Exception:
+                return None
+
+        def _heartbeat():
+            secs = 0
+            while not load_done.wait(5):
+                secs += 5
+                mib = _current_download_mib()
+                if mib is not None and mib > 1.0:
+                    pct = min(99, int(mib / expected * 100))
+                    msg = f"Downloading Whisper model: {mib:.0f} / ~{expected} MiB ({pct}%)"
+                else:
+                    msg = f"Loading Whisper model... ({secs}s)"
+                try:
+                    res_queue.put(("progress", 5, msg))
+                except Exception:
+                    return
+        threading.Thread(target=_heartbeat, daemon=True).start()
+
+        try:
+            try:
+                model = WhisperModel(model_size, device=device, compute_type=compute_type,
+                                     cpu_threads=4, num_workers=2)
+            except Exception:
+                res_queue.put(("progress", 5, f"'{model_size}' unavailable; falling back to 'medium'"))
+                model = WhisperModel("medium", device=device, compute_type=compute_type,
+                                     cpu_threads=4, num_workers=2)
+        finally:
+            load_done.set()
+
+        use_batched = device == "cuda" and BatchedInferencePipeline is not None
+        transcriber = BatchedInferencePipeline(model=model) if use_batched else None
+
+        common_kwargs = dict(
+            beam_size=5,
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+        )
+
+        res_queue.put(("ready",))
+
+        while True:
+            cmd = cmd_queue.get()
+            if cmd[0] == "shutdown":
+                break
+
+            chunk_path, chunk_start = cmd[1], float(cmd[2])
+
+            try:
+                if use_batched:
+                    segments, info = transcriber.transcribe(chunk_path, batch_size=16, **common_kwargs)
+                else:
+                    segments, info = model.transcribe(chunk_path, **common_kwargs)
+
+                all_words = []
+                total_dur = max(info.duration, 1e-6)
+                for i, seg in enumerate(segments):
+                    if seg.words:
+                        all_words.extend(seg.words)
+                    if i % 5 == 0:
+                        pct = int((seg.end / total_dur) * 90)
+                        res_queue.put(("progress", pct,
+                                       f"Transcribing at {int(seg.end)}s / {int(total_dur)}s"))
+
+                result = _aggregate_words_to_sentences(all_words, time_offset=chunk_start)
+                res_queue.put(("chunk_result", chunk_start, result))
+
+            except Exception as exc:
+                import traceback; traceback.print_exc()
+                res_queue.put(("chunk_error", chunk_start, str(exc)))
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        res_queue.put(("fatal_error", str(exc)))
 
 
