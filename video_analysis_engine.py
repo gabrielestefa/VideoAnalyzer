@@ -28,8 +28,15 @@ except ImportError:
 try:
     from faster_whisper import WhisperModel
     FASTER_WHISPER_AVAILABLE = True
+    try:
+        # BatchedInferencePipeline is required for batched CUDA inference.
+        # Available in faster-whisper >= 1.0.0; older versions degrade gracefully.
+        from faster_whisper import BatchedInferencePipeline
+    except ImportError:
+        BatchedInferencePipeline = None
 except ImportError:
     WhisperModel = None
+    BatchedInferencePipeline = None
     FASTER_WHISPER_AVAILABLE = False
 
 try:
@@ -295,11 +302,18 @@ class VideoAnalysisEngine:
 
                 # Drain the queue WHILE the process runs — calling p.join() first
                 # would deadlock if the worker fills the OS pipe buffer before we read.
+                # Stall guard: if no progress in MAX_STALL_SECONDS, terminate worker.
                 import queue as _queue_mod
+                MAX_STALL_SECONDS = 60 * 60  # 1h hard limit; reasonable for huge files
+                last_progress_time = time.time()
+                last_progress_percent = 15
+
                 while True:
                     try:
                         msg = msg_queue.get(timeout=0.1)
                         if msg[0] == "progress":
+                            last_progress_time = time.time()
+                            last_progress_percent = msg[1]
                             if progress_callback:
                                 progress_callback(msg[1], msg[2])
                         elif msg[0] == "result":
@@ -310,8 +324,23 @@ class VideoAnalysisEngine:
                     except _queue_mod.Empty:
                         if not p.is_alive():
                             break
+                        if time.time() - last_progress_time > MAX_STALL_SECONDS:
+                            logging.error("Transcription worker stalled for %ds; terminating",
+                                          MAX_STALL_SECONDS)
+                            if progress_callback:
+                                progress_callback(last_progress_percent,
+                                                  "Transcription stalled; terminating worker...")
+                            p.terminate()
+                            p.join(timeout=5)
+                            if p.is_alive():
+                                p.kill()
+                            break
 
-                p.join()
+                p.join(timeout=5)
+                if p.is_alive():
+                    logging.error("Transcription worker did not exit cleanly; killing process")
+                    p.kill()
+                    p.join()
 
                 # Final drain for any messages that arrived in the last window
                 while not msg_queue.empty():
@@ -1124,15 +1153,19 @@ def _worker_whisper_transcribe(audio_path, model_size, queue):
         # Check availability again within the process
         try:
             from faster_whisper import WhisperModel
+            try:
+                from faster_whisper import BatchedInferencePipeline
+            except ImportError:
+                BatchedInferencePipeline = None
         except ImportError:
             queue.put(("error", "faster-whisper not installed in subprocess"))
             return
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
-        
+
         queue.put(("progress", 20, f"Loading '{model_size}' model on {device}..."))
-        
+
         try:
             model = WhisperModel(model_size, device=device, compute_type=compute_type, cpu_threads=4, num_workers=2)
         except Exception as e:
@@ -1140,17 +1173,30 @@ def _worker_whisper_transcribe(audio_path, model_size, queue):
             model = WhisperModel("medium", device=device, compute_type=compute_type, cpu_threads=4, num_workers=2)
 
         queue.put(("progress", 25, "Transcribing audio..."))
-        
-        # Run transcription — batch_size feeds multiple chunks to the GPU simultaneously,
-        # significantly increasing utilization on longer audio files.
-        segments, info = model.transcribe(
-            audio_path,
+
+        # WhisperModel.transcribe() does NOT accept batch_size — that argument
+        # belongs to BatchedInferencePipeline. Use batched inference on CUDA
+        # for higher GPU utilisation; fall back to plain transcribe on CPU.
+        common_kwargs = dict(
             beam_size=5,
             word_timestamps=True,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
-            batch_size=16 if device == "cuda" else 1,
         )
+        if device == "cuda" and BatchedInferencePipeline is not None:
+            try:
+                transcriber = BatchedInferencePipeline(model=model)
+                segments, info = transcriber.transcribe(
+                    audio_path, batch_size=16, **common_kwargs,
+                )
+            except Exception as batched_err:
+                # Some VAD/batched combinations can fail on certain audio;
+                # gracefully fall back to standard inference.
+                queue.put(("progress", 25,
+                           f"Batched inference failed ({batched_err.__class__.__name__}); using standard"))
+                segments, info = model.transcribe(audio_path, **common_kwargs)
+        else:
+            segments, info = model.transcribe(audio_path, **common_kwargs)
 
         # Process segments (Aggregation)
         all_words = []

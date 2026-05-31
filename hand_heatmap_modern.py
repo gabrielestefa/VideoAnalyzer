@@ -1,3 +1,11 @@
+# Dependency check must run BEFORE any heavy third-party imports.
+# It uses only the Python standard library so it can never fail on a fresh
+# install. If anything from requirements.txt is missing, the user is offered
+# a one-click install (with an expandable details panel) before we attempt
+# the imports below.
+from dependency_check import ensure_dependencies
+ensure_dependencies()
+
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
