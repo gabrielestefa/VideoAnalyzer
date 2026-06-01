@@ -292,6 +292,32 @@ This phase touches:
   heuristic is uncertain
 - **Grounding DINO text-prompted detection** to let the user say "track the
   guitar" and have it segmented even though it isn't a COCO class
+- **Fine-grained gesture vocabulary for RTMW.** Today, when RTMW is the
+  active pose backend, gestures are produced by `PoseGestureClassifier`
+  ([pose_backends.py](pose_backends.py)) — a small rule-based classifier
+  that reproduces the 7 labels MediaPipe's built-in model emits
+  (`Closed_Fist`, `Open_Palm`, `Pointing_Up`, `Thumb_Up`, `Thumb_Down`,
+  `Victory`, `ILoveYou`). This is parity-preserving but coarse; many real
+  hand configurations fall through into the `None` bucket. Two upgrade
+  paths once segmentation + HOI are live:
+
+  1. **Train a lightweight MLP on RTMW hand keypoints** (21 × 2 or 21 × 3
+     normalized coords → softmax over an expanded label set). Datasets:
+     [HaGRID](https://github.com/hukenovs/hagrid) (~552 K samples,
+     18 gesture classes) or [Jester](https://www.qualcomm.com/developer/software/jester-dataset)
+     for dynamic gestures. A 3-layer MLP trains in minutes on a single
+     GPU and runs in < 1 ms per hand. Drop it in beside
+     `PoseGestureClassifier` as a second strategy with a confidence
+     threshold; fall back to the rule-based classifier when the MLP isn't
+     confident.
+  2. **Add a dynamic-gesture head** (LSTM / small Transformer) that
+     consumes a sliding window of N RTMW frames so the system can label
+     swipes, waves, finger-snaps, and other motions the per-frame
+     classifier can never see. Output joins `gesture_history_*` with a
+     time-span instead of a single frame.
+
+  Either path lives behind the existing backend interface — no engine
+  changes required beyond swapping the classifier instance.
 
 ---
 

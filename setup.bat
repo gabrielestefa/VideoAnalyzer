@@ -74,12 +74,12 @@ goto CUDA_PIP
 :CUDA_UV
 uv pip install --python .venv\Scripts\python.exe "torch>=2.6.0" torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 if errorlevel 1 goto FAIL_TORCH
-goto DONE
+goto RTMW_START
 
 :CUDA_PIP
 .venv\Scripts\python.exe -m pip install "torch>=2.6.0" torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 if errorlevel 1 goto FAIL_TORCH
-goto DONE
+goto RTMW_START
 
 :INSTALL_CPU
 echo [GPU] No NVIDIA GPU detected - installing CPU-only PyTorch.
@@ -90,11 +90,78 @@ goto CPU_PIP
 :CPU_UV
 uv pip install --python .venv\Scripts\python.exe "torch>=2.6.0" torchvision torchaudio
 if errorlevel 1 goto FAIL_TORCH
-goto DONE
+goto RTMW_START
 
 :CPU_PIP
 .venv\Scripts\python.exe -m pip install "torch>=2.6.0" torchvision torchaudio
 if errorlevel 1 goto FAIL_TORCH
+goto RTMW_START
+
+REM ===============================================================
+REM  Step 4: Profile-gated optional components
+REM  Asks gpu_profile.py which heavy stacks this machine should install.
+REM  CPU-only / very-low-VRAM machines skip the 2 GB mmpose download.
+REM ===============================================================
+
+:RTMW_START
+.venv\Scripts\python.exe gpu_profile.py components > "%TEMP%\va_comps.txt" 2>nul
+set /p VA_COMPONENTS=<"%TEMP%\va_comps.txt"
+del "%TEMP%\va_comps.txt" >nul 2>&1
+if "%VA_COMPONENTS%"=="" set VA_COMPONENTS=
+echo.
+echo Profile components for this machine: %VA_COMPONENTS%
+
+REM Check whether RTMW is needed; otherwise skip the install entirely.
+echo %VA_COMPONENTS% | findstr /C:"rtmw" >nul
+if errorlevel 1 goto SKIP_RTMW
+
+echo Installing whole-body pose stack (RTMW)...
+echo This adds about 2 GB and takes 3-10 minutes on first run.
+echo If it fails, the app still works using MediaPipe (hands only).
+echo.
+
+.venv\Scripts\python.exe -m pip install -q openmim
+if errorlevel 1 goto RTMW_WARN
+
+.venv\Scripts\mim.exe install mmengine
+if errorlevel 1 goto RTMW_WARN
+
+REM mmcv-lite: pure-Python build (no CUDA C++ ops).  OpenMMLab does not
+REM publish full-mmcv wheels for torch 2.6 + cu124 + py3.11 + Windows, and
+REM source-building requires the full CUDA Toolkit.  mmcv-lite is enough
+REM for RTMW inference; GPU acceleration still happens via PyTorch.
+.venv\Scripts\python.exe -m pip install "mmcv-lite>=2.0.0"
+if errorlevel 1 goto RTMW_WARN
+
+.venv\Scripts\mim.exe install "mmdet>=3.2.0,<4.0"
+if errorlevel 1 goto RTMW_WARN
+
+REM mmpose --no-deps skips chumpy (broken build, SMPL-only dep we don't use).
+.venv\Scripts\python.exe -m pip install --no-deps "mmpose>=1.3.0,<2.0"
+if errorlevel 1 goto RTMW_WARN
+.venv\Scripts\python.exe -m pip install xtcocotools json_tricks munkres
+if errorlevel 1 goto RTMW_WARN
+
+REM Install mmcv._ext no-op stub so mmpose transformer heads can import
+REM (mmcv-lite ships mmcv.ops but not the CUDA C extension it expects).
+.venv\Scripts\python.exe install_mmcv_ext_stub.py
+if errorlevel 1 goto RTMW_WARN
+
+echo.
+echo [RTMW] Installed successfully.
+goto DONE
+
+:SKIP_RTMW
+echo [RTMW] Not required for this hardware profile. Skipping (~2 GB saved).
+goto DONE
+
+:RTMW_WARN
+echo.
+echo ========================================
+echo  WARNING: RTMW install failed.
+echo  App will still work using MediaPipe (hands only).
+echo  Retry later with:  install_rtmw.bat
+echo ========================================
 goto DONE
 
 REM ===============================================================

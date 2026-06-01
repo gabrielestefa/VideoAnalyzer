@@ -476,6 +476,266 @@ def _ensure_torch() -> None:
             print("[DependencyCheck] PyTorch install failed; some features will be unavailable.")
 
 
+# ---------------------------------------------------------------------------
+# RTMW whole-body pose stack (mmpose + mmcv + mmdet + mmengine).
+# Heavy (~2 GB) so we install it via openmim, which finds wheels matching
+# the installed torch+CUDA combo.  Failure is non-fatal — the engine falls
+# back to MediaPipe (hands only).
+# ---------------------------------------------------------------------------
+
+def _ensure_mmpose() -> None:
+    """If mmpose isn't installed, offer a one-click install via mim.
+
+    Skipped silently when the selected hardware profile doesn't need RTMW
+    (e.g. CPU-only or sub-4 GB VRAM machines — MediaPipe is the right
+    choice there and we shouldn't push a 2 GB download.)
+    """
+    try:
+        import mmpose  # noqa: F401
+        return  # already installed — happy path
+    except ImportError:
+        pass
+
+    # Profile gate: only ask if RTMW is actually part of this profile's stack.
+    try:
+        from gpu_profile import select_profile, required_components
+        comps = required_components(select_profile())
+        if "rtmw" not in comps:
+            print("[DependencyCheck] Profile does not require RTMW; skipping install prompt.")
+            return
+    except Exception as e:
+        print(f"[DependencyCheck] Profile check failed ({e}); falling through to prompt.")
+
+    root = tk.Tk()
+    root.withdraw()
+    from tkinter import messagebox
+    install = messagebox.askyesno(
+        "Install whole-body pose? (RTMW)",
+        "RTMW provides whole-body pose estimation:\n"
+        " - 17 body keypoints (arms, legs, torso, head)\n"
+        " - 21 + 21 hand keypoints\n"
+        " - 68 face keypoints\n\n"
+        "Install now?\n"
+        "Size: ~2 GB.  Time: 3-10 minutes.\n\n"
+        "Without it, only MediaPipe (hands only) is available.",
+    )
+    root.destroy()
+    if not install:
+        print("[DependencyCheck] User declined RTMW install.")
+        return
+
+    ok = _install_mmpose_window()
+    if not ok:
+        print("[DependencyCheck] RTMW install failed; engine will use MediaPipe.")
+
+
+def _install_mmpose_window() -> bool:
+    """Install the OpenMMLab stack via openmim with a progress popup."""
+    venv_python = sys.executable
+    venv_dir = os.path.dirname(venv_python)
+    mim_exe = os.path.join(venv_dir, "mim.exe")
+
+    win = tk.Tk()
+    win.title("Installing RTMW (whole-body pose)…")
+    win.geometry("580x420")
+    frame = ttk.Frame(win, padding=16)
+    frame.pack(fill="both", expand=True)
+    ttk.Label(frame, text="Installing RTMW whole-body pose stack",
+              font=("Segoe UI", 12, "bold")).pack(anchor="w")
+    ttk.Label(frame,
+              text=("Pulls wheels matching the installed torch+CUDA combo via "
+                    "openmim. Expect ~2 GB and 3-10 min."),
+              justify="left", foreground="#555", wraplength=540
+              ).pack(anchor="w", pady=(4, 8))
+    current = ttk.Label(frame, text="", foreground="#0a4d8c",
+                        font=("Segoe UI", 10, "bold"))
+    current.pack(anchor="w", pady=(0, 2))
+    status = ttk.Label(frame, text="Starting…", foreground="#555")
+    status.pack(anchor="w", pady=(0, 4))
+    log = scrolledtext.ScrolledText(frame, height=12, font=("Consolas", 9))
+    log.pack(fill="both", expand=True)
+    win.update()
+
+    def append(line: str):
+        log.insert("end", line); log.see("end")
+    def set_status(text: str):
+        status.configure(text=text)
+    def set_current(text: str):
+        current.configure(text=text)
+
+    # Step 1 — openmim itself.  Use uv when available for speed.
+    uv = _find_uv()
+    if uv:
+        cmd_mim = [uv, "pip", "install", "--python", venv_python, "openmim"]
+    else:
+        cmd_mim = [venv_python, "-m", "pip", "install", "openmim"]
+    append("$ " + " ".join(cmd_mim) + "\n")
+    rc = _run_installer_with_progress(cmd_mim, append, set_status, set_current, win)
+    if rc != 0:
+        status.configure(text="openmim install failed.", foreground="#a8071a")
+        ttk.Button(frame, text="Close", command=win.destroy).pack(pady=(8, 0))
+        win.mainloop()
+        return False
+
+    if not os.path.exists(mim_exe):
+        # uv installs may put scripts in a different location; fall back to
+        # invoking mim through python -m.
+        mim_call = [venv_python, "-m", "mim"]
+    else:
+        mim_call = [mim_exe]
+
+    # mmcv-lite is the right pick for this project — see install_rtmw.bat
+    # for the full reasoning.  TL;DR: no prebuilt full-mmcv wheels for our
+    # torch+CUDA+python combo on Windows, and source build needs the CUDA
+    # Toolkit.  Inference works fine on mmcv-lite; GPU acceleration is
+    # provided by PyTorch directly.
+    # mmpose --no-deps + manual runtime deps: skips chumpy (deprecated SMPL
+    # lib whose setup.py breaks in pip's build-isolation env).  RTMW only
+    # does 2D keypoint extraction, so chumpy is never touched at runtime.
+    steps = [
+        ("mmengine", mim_call + ["install", "mmengine"]),
+        ("mmcv-lite", [venv_python, "-m", "pip", "install", "mmcv-lite>=2.0.0"]),
+        ("mmdet", mim_call + ["install", "mmdet>=3.2.0,<4.0"]),
+        ("mmpose (without SMPL deps)",
+            [venv_python, "-m", "pip", "install", "--no-deps", "mmpose>=1.3.0,<2.0"]),
+        ("mmpose runtime deps",
+            [venv_python, "-m", "pip", "install", "xtcocotools", "json_tricks", "munkres"]),
+    ]
+    for label, cmd in steps:
+        set_current(f"Installing {label}…")
+        win.update()
+        append("\n$ " + " ".join(cmd) + "\n")
+        rc = _run_installer_with_progress(cmd, append, set_status, set_current, win)
+        if rc != 0:
+            status.configure(text=f"Install of {label} failed (exit {rc}).",
+                             foreground="#a8071a")
+            ttk.Button(frame, text="Close", command=win.destroy).pack(pady=(8, 0))
+            win.mainloop()
+            return False
+
+    set_current("")
+    status.configure(text="RTMW installed!  Set VIDEOANALYZER_BACKEND=rtmw to use it.",
+                     foreground="#0a7d2b")
+    ttk.Button(frame, text="Continue", command=win.destroy).pack(pady=(8, 0))
+    win.mainloop()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Model assets — small files (~15 MB) Google hosts on a stable CDN.  We
+# auto-download on first launch so a fresh clone of the repo "just works"
+# without the user having to chase model files manually.
+# ---------------------------------------------------------------------------
+
+# (filename, url, required, sha256_prefix_or_None)
+_REQUIRED_MODELS = [
+    (
+        "gesture_recognizer.task",
+        "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/"
+        "gesture_recognizer/float16/1/gesture_recognizer.task",
+        True,
+    ),
+    (
+        "universal_sentence_encoder.tflite",
+        "https://storage.googleapis.com/mediapipe-tasks/text_embedder/"
+        "universal_sentence_encoder.tflite",
+        False,  # optional — text similarity gracefully degrades without it
+    ),
+]
+
+
+def _download_with_progress(url: str, dest_path: str, label: str) -> bool:
+    """
+    Download a file with a small tk progress dialog.  Returns True on success.
+    Uses stdlib urllib so no extra deps are required.
+    """
+    import urllib.request
+    import urllib.error
+
+    win = tk.Tk()
+    win.title(f"Downloading {label}…")
+    win.geometry("520x150")
+    win.resizable(False, False)
+    f = ttk.Frame(win, padding=18)
+    f.pack(fill="both", expand=True)
+    ttk.Label(f, text=f"Downloading {label}", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+    sub = ttk.Label(f, text="Starting…", foreground="#555")
+    sub.pack(anchor="w", pady=(4, 8))
+    bar = ttk.Progressbar(f, orient="horizontal", mode="determinate", maximum=100)
+    bar.pack(fill="x")
+    win.update()
+
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    tmp_path = dest_path + ".part"
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "VideoAnalyzer-setup/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total = int(resp.headers.get("Content-Length", "0"))
+            done = 0
+            chunk_size = 64 * 1024
+            with open(tmp_path, "wb") as out:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        pct = int(done / total * 100)
+                        bar["value"] = pct
+                        sub.configure(text=f"{done/1024/1024:.1f} / {total/1024/1024:.1f} MiB ({pct}%)")
+                    else:
+                        sub.configure(text=f"{done/1024/1024:.1f} MiB")
+                    win.update()
+        os.replace(tmp_path, dest_path)
+        win.destroy()
+        return True
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        print(f"[DependencyCheck] Download failed for {label}: {e}")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        sub.configure(text=f"Failed: {e}", foreground="#a8071a")
+        ttk.Button(f, text="Close", command=win.destroy).pack(pady=(8, 0))
+        win.mainloop()
+        return False
+
+
+def _ensure_models() -> None:
+    """
+    Make sure the MediaPipe model assets are present in ./Models/.
+    Required models block the launch on failure; optional ones just warn.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(here, "Models")
+
+    for filename, url, required in _REQUIRED_MODELS:
+        dest = os.path.join(models_dir, filename)
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            continue
+        print(f"[DependencyCheck] Missing model: {filename}")
+        ok = _download_with_progress(url, dest, label=filename)
+        if not ok:
+            if required:
+                print(f"[DependencyCheck] FATAL: required model {filename} could not be downloaded")
+                root = tk.Tk()
+                root.withdraw()
+                from tkinter import messagebox
+                messagebox.showerror(
+                    "Model download failed",
+                    f"Could not download {filename}.\n\n"
+                    f"Check your internet connection and try again.\n\n"
+                    f"You can also download it manually from:\n{url}\n"
+                    f"and place it in:\n{models_dir}",
+                )
+                root.destroy()
+                sys.exit(1)
+            else:
+                print(f"[DependencyCheck] Optional model {filename} unavailable; continuing.")
+
+
 def ensure_dependencies(requirements_path: str | None = None) -> None:
     """Probe each requirements.txt entry. Prompt the user if any are missing.
 
@@ -509,39 +769,44 @@ def ensure_dependencies(requirements_path: str | None = None) -> None:
             # Fall through and continue in the current interpreter
 
     missing = _missing(requirements_path)
-    if not missing:
-        return
+    if missing:
+        print(f"[DependencyCheck] {len(missing)} packages missing:",
+              ", ".join(n for n, _ in missing))
 
-    print(f"[DependencyCheck] {len(missing)} packages missing:",
-          ", ".join(n for n, _ in missing))
+        # Not inside a venv AND no .venv exists yet: hand off to run.bat to
+        # do first-time setup (creates .venv with correct Python, installs).
+        if not _is_in_venv():
+            if _relaunch_via_run_bat(here):
+                return  # _relaunch_via_run_bat calls sys.exit — never reached
+            # run.bat not found: fall through and try a direct install.
 
-    # Not inside a venv AND no .venv exists yet: hand off to run.bat to do
-    # first-time setup (creates .venv with correct Python, installs packages).
-    if not _is_in_venv():
-        if _relaunch_via_run_bat(here):
-            return  # _relaunch_via_run_bat calls sys.exit — never reached
-        # run.bat not found: fall through and try a direct in-place install.
+        prompt = _DependencyPrompt(missing)
+        choice = prompt.run()
 
-    prompt = _DependencyPrompt(missing)
-    choice = prompt.run()
+        if choice != "yes":
+            print("[DependencyCheck] User declined install — exiting.")
+            sys.exit(0)
 
-    if choice != "yes":
-        print("[DependencyCheck] User declined install — exiting.")
-        sys.exit(0)
+        ok = _install_progress_window(missing)
+        if not ok:
+            print("[DependencyCheck] Install failed; exiting.")
+            sys.exit(1)
 
-    ok = _install_progress_window(missing)
-    if not ok:
-        print("[DependencyCheck] Install failed; exiting.")
-        sys.exit(1)
+        # Re-check after install. Warn if anything is still absent — a
+        # restart may be needed for entry-points / C extensions.
+        still_missing = _missing(requirements_path)
+        if still_missing:
+            print("[DependencyCheck] Still missing after install:",
+                  ", ".join(n for n, _ in still_missing))
+            print("[DependencyCheck] You may need to restart the application.")
 
-    # Re-check after install. Warn if anything is still absent — a restart
-    # may be needed for packages that register entry-points or C extensions.
-    still_missing = _missing(requirements_path)
-    if still_missing:
-        print("[DependencyCheck] Still missing after install:",
-              ", ".join(n for n, _ in still_missing))
-        print("[DependencyCheck] You may need to restart the application.")
-
-    # PyTorch is not in requirements.txt because its index URL varies by GPU.
-    # Check it separately here.
+    # These three checks run on EVERY launch (they no-op silently when their
+    # target is present), so existing venvs created before later phases pick
+    # up the new requirements without the user having to delete .venv.
+    #
+    # PyTorch — index URL varies by GPU, so not in requirements.txt.
     _ensure_torch()
+    # MediaPipe model assets — auto-downloaded so a fresh clone "just works".
+    _ensure_models()
+    # RTMW whole-body pose stack — opt-in, prompts on first detect.
+    _ensure_mmpose()

@@ -47,6 +47,20 @@ HAND_CONNECTIONS = frozenset([
     (13, 17), (0, 17), (17, 18), (18, 19), (19, 20)
 ])
 
+# COCO-17 body skeleton (matches RTMW body keypoint slice, indices 0..16):
+# 0 nose, 1/2 eyes, 3/4 ears, 5/6 shoulders, 7/8 elbows, 9/10 wrists,
+# 11/12 hips, 13/14 knees, 15/16 ankles.
+BODY_CONNECTIONS = frozenset([
+    (5, 6),                        # shoulders
+    (5, 7), (7, 9),                # left arm
+    (6, 8), (8, 10),               # right arm
+    (5, 11), (6, 12), (11, 12),    # torso
+    (11, 13), (13, 15),            # left leg
+    (12, 14), (14, 16),            # right leg
+    (0, 1), (0, 2), (1, 3), (2, 4),  # head
+    (0, 5), (0, 6),                # neck to shoulders
+])
+
 import math
 
 class AudioWaveVisualizer(tk.Canvas):
@@ -351,7 +365,7 @@ class ModernHandTrackerApp(ctk.CTk):
             
             # Video only - no audio
             self.engine.process_video(progress_callback=on_progress, enable_audio=False)
-            self.after(0, self.on_analysis_complete)
+            self.after(0, self.on_video_analysis_complete)
             
         except Exception as e:
             self.after(0, lambda: messagebox.showerror("Analysis Error", str(e)))
@@ -395,7 +409,7 @@ class ModernHandTrackerApp(ctk.CTk):
             
             use_audio = enable_audio if enable_audio is not None else (self.check_audio.get() == 1)
             self.engine.process_video(progress_callback=on_progress, enable_audio=use_audio)
-            self.after(0, self.on_analysis_complete)
+            self.after(0, self.on_video_analysis_complete)
             
         except Exception as e:
             self.after(0, lambda: messagebox.showerror("Analysis Error", str(e)))
@@ -536,22 +550,63 @@ class ModernHandTrackerApp(ctk.CTk):
                 overlay[mask] = cv2.addWeighted(frame[mask], 1-alpha, hmap_color[mask], alpha, 0)
                 frame = overlay
 
-        # 2. Skeleton (Full Hand)
+        # 2. Skeleton (whole-body when available, else hands)
         if self.check_skeleton.get() == 1:
-            if idx < len(self.engine.landmarks_list):
-                 for landmarks, label in self.engine.landmarks_list[idx]:
-                     points = []
-                     for lm in landmarks:
-                         x, y = int(lm.x * self.engine.video_width), int(lm.y * self.engine.video_height)
-                         points.append((x, y))
-                     
-                     r_points = [self.rotate_pt(p, self.rotation_angle, self.engine.video_width, self.engine.video_height) for p in points]
+            W, H = self.engine.video_width, self.engine.video_height
 
-                     connections = HAND_CONNECTIONS
-                     for start_idx, end_idx in connections:
-                         cv2.line(frame, r_points[start_idx], r_points[end_idx], (0, 255, 0), 2)
-                     for p in r_points:
-                         cv2.circle(frame, p, 3, (0, 0, 255), -1)
+            def _draw_kps(kps, connections, line_color, dot_color,
+                          line_w=2, dot_r=3, min_vis=0.0):
+                """Draw a rotated keypoint set with optional bone connections."""
+                if not kps:
+                    return
+                r_points = []
+                for lm in kps:
+                    p = (int(lm.x * W), int(lm.y * H))
+                    r_points.append(self.rotate_pt(p, self.rotation_angle, W, H))
+                vis = [getattr(lm, "visibility", 1.0) for lm in kps]
+                for a, b in connections:
+                    if a < len(r_points) and b < len(r_points):
+                        if vis[a] >= min_vis and vis[b] >= min_vis:
+                            cv2.line(frame, r_points[a], r_points[b], line_color, line_w)
+                for p, v in zip(r_points, vis):
+                    if v >= min_vis:
+                        cv2.circle(frame, p, dot_r, dot_color, -1)
+
+            # Body skeleton — draw EVERY detected person.  Prefer the
+            # multi-person list (RTMW); fall back to single-subject list for
+            # older sessions that pre-date multi-person support.
+            body_all = getattr(self.engine, "body_landmarks_list_all", [])
+            face_all = getattr(self.engine, "face_landmarks_list_all", [])
+            body_single = getattr(self.engine, "body_landmarks_list", [])
+            face_single = getattr(self.engine, "face_landmarks_list", [])
+
+            people_bodies: list = []
+            if idx < len(body_all) and body_all[idx]:
+                people_bodies = body_all[idx]
+            elif idx < len(body_single) and body_single[idx]:
+                people_bodies = [body_single[idx]]
+
+            people_faces: list = []
+            if idx < len(face_all) and face_all[idx]:
+                people_faces = face_all[idx]
+            elif idx < len(face_single) and face_single[idx]:
+                people_faces = [face_single[idx]]
+
+            for body_kps in people_bodies:
+                _draw_kps(body_kps, BODY_CONNECTIONS,
+                          line_color=(255, 255, 0), dot_color=(0, 255, 255),
+                          line_w=2, dot_r=4, min_vis=0.3)
+            for face_kps in people_faces:
+                _draw_kps(face_kps, frozenset(),
+                          line_color=(0, 0, 0), dot_color=(255, 0, 255),
+                          dot_r=1, min_vis=0.3)
+
+            # Hands — green bones, red joints (original look preserved)
+            if idx < len(self.engine.landmarks_list):
+                for landmarks, label in self.engine.landmarks_list[idx]:
+                    _draw_kps(landmarks, HAND_CONNECTIONS,
+                              line_color=(0, 255, 0), dot_color=(0, 0, 255),
+                              line_w=2, dot_r=3)
 
         # 3. Traces
         if self.check_trace.get() == 1:
@@ -1212,79 +1267,6 @@ class ModernHandTrackerApp(ctk.CTk):
                 self.show_frame(0)
         else:
             messagebox.showerror("Error", f"Failed to load: {msg}")
-
-    def compare_selected(self, lib_window=None):
-        selected = [f for f, var in self.lib_selections.items() if var.get()]
-        if len(selected) < 2:
-            messagebox.showwarning("Compare", "Please select at least 2 files to compare.")
-            return
-
-        # Close library window if provided
-        if lib_window:
-            lib_window.destroy()
-
-        comp_win = ctk.CTkToplevel(self)
-        comp_win.title("Comparison View")
-        comp_win.geometry("1400x900")
-        comp_win.attributes('-topmost', True) # Keep on top
-        comp_win.lift()
-        comp_win.focus_force()
-        
-        # Load Data for all selected
-        lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Library") 
-        
-        loaded_objects = [] # List of (filename, engine_instance)
-        
-        progress = ctk.CTkProgressBar(comp_win)
-        progress.pack(pady=10)
-        progress.set(0)
-        lbl = ctk.CTkLabel(comp_win, text="Loading and Analyzing...")
-        lbl.pack()
-        comp_win.update()
-        
-        try:
-            for i, f in enumerate(selected):
-                path = os.path.join(lib_dir, f)
-                # New engine instance for each to keep data separate
-                eng = VideoAnalysisEngine(GESTURE_MODEL_PATH)
-                eng.load_analysis(path) 
-                loaded_objects.append({'name': f, 'engine': eng})
-                progress.set((i+1)/len(selected))
-                comp_win.update()
-        except:
-            lbl.configure(text="Error loading files.")
-            return
-
-        progress.destroy()
-        lbl.destroy()
-        
-        # Tabs
-        tab_view = ctk.CTkTabview(comp_win)
-        tab_view.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        tab_metrics = tab_view.add("Performance Metrics")
-        tab_spatial = tab_view.add("Spatial Analysis")
-        tab_semantic = tab_view.add("Semantic (Speech)")
-        
-        # --- TAB 1: Metrics ---
-        self.plot_comparison_metrics(tab_metrics, loaded_objects)
-        self.plot_gesture_comparison(tab_metrics, loaded_objects) # Add below metrics
-        
-        # --- TAB 2: Spatial ---
-        self.plot_spatial_comparison(tab_spatial, loaded_objects)
-        
-        # --- TAB 3: Semantic ---
-        print("\n ABOUT TO CALL plot_semantic_comparison...")
-        self.plot_semantic_comparison(tab_semantic, loaded_objects)
-        print(" plot_semantic_comparison RETURNED")
-
-        # --- EPISODE ANALYSIS TABS (NEW) ---
-        try:
-            from episode_comparison import add_episode_tabs
-            add_episode_tabs(tab_view, loaded_objects, comp_win)
-        except Exception as e:
-            print(f"Episode tabs integration failed: {e}")
-
 
     def get_comparison_metrics_figure(self, objects):
         stats_list = []

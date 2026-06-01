@@ -14,6 +14,11 @@ import time
 from datetime import datetime
 from episode_analyzer import EpisodeAnalyzer, Episode
 
+# Phase 0/1: pluggable pose backends.  See VISION_UPGRADE_PLAN.md and
+# pose_backends.py.  Default still MediaPipe — opt into RTMW via
+# VIDEOANALYZER_BACKEND=rtmw (requires `pip install -r requirements-rtmw.txt`).
+from pose_backends import BackendBase, FrameResult, make_backend
+
 # Top-level imports for stability
 try:
     from moviepy import VideoFileClip
@@ -56,6 +61,29 @@ HEATMAP_BLUR_KERNEL = 51      # Gaussian blur kernel size (must be odd)
 HEATMAP_BLOCK_RADIUS = 5      # Pixel radius of speed contribution per point
 AUDIO_CHUNK_SECONDS = 10      # Length of each Google Speech API chunk (seconds)
 
+
+def _format_duration(seconds: float) -> str:
+    """Human-readable duration, e.g. '45s', '2m 14s', '1h 3m'."""
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+
+# Whole-body heatmap/trace sources, available when a whole-body backend
+# (RTMW) populated body_landmarks_list.  COCO-17 indices:
+#   0 nose, 5/6 shoulders, 7/8 elbows, 9/10 wrists,
+#   11/12 hips, 13/14 knees, 15/16 ankles.
+# Value = (heatmap_indices, left_trace_idx, right_trace_idx).
+BODY_HEATMAP_SOURCES = {
+    "Body: Full Pose": (list(range(17)), 9, 10),
+    "Body: Arms":      ([5, 7, 9, 6, 8, 10], 9, 10),
+    "Body: Legs":      ([11, 13, 15, 12, 14, 16], 15, 16),
+    "Body: Head":      ([0, 1, 2, 3, 4], 0, 0),
+}
+
 STOP_WORDS = {
     "the", "be", "to", "of", "and", "a", "in", "that", "have", "i", "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
     "this", "but", "his", "by", "from", "they", "we", "say", "her", "she", "or", "an", "will", "my", "one", "all", "would", "there",
@@ -72,13 +100,31 @@ class LandmarkCompat:
         self.z = z
 
 class VideoAnalysisEngine:
-    def __init__(self, model_path):
+    def __init__(self, model_path, backend_name: str | None = None):
         self.model_path = model_path
+        # Backend selection: explicit arg → env var → "auto".  "auto" prefers
+        # MediaPipe unless RTMW is installed and a GPU profile is selected.
+        self.backend_name = (
+            backend_name
+            or os.environ.get("VIDEOANALYZER_BACKEND")
+            or "auto"
+        )
+        self.backend: BackendBase | None = None  # built lazily in process_video
         self.video_path = None
         self.frames = []
         self.heatmap = None
         self.speed_heatmap = None
         self.landmarks_list = []
+        # Phase 1: body / face keypoints from whole-body backends (None for
+        # MediaPipe).  Same per-frame indexing as landmarks_list.
+        self.body_landmarks_list: list = []
+        self.face_landmarks_list: list = []
+        # Multi-person tracking (RTMW): each frame stores list of per-person
+        # keypoint arrays.  Heatmaps/traces still use the single-subject
+        # lists above (body_landmarks_list / face_landmarks_list); the
+        # _all variants drive the multi-subject UI overlay.
+        self.body_landmarks_list_all: list = []
+        self.face_landmarks_list_all: list = []
         self.trace_path_left = []
         self.trace_path_right = []
         self.gesture_history_left = []
@@ -143,21 +189,23 @@ class VideoAnalysisEngine:
         if progress_callback:
             progress_callback(0, f"Initializing analysis \n ({num_chunks} chunks, ~1 min each)")
         
-        base_options = python.BaseOptions(model_asset_path=self.model_path)
-        recognizer = GestureRecognizer.create_from_options(
-            GestureRecognizerOptions(
-                base_options=base_options,
-                running_mode=RunningMode.VIDEO,
-                num_hands=2,
-                min_hand_detection_confidence=sensitivity,
-                min_hand_presence_confidence=sensitivity,
-                min_tracking_confidence=sensitivity
-            )
-        )
+        # Build the pose backend.  Sensitivity is forwarded — only the
+        # MediaPipe backend uses it; RTMW handles thresholds internally.
+        if self.backend is not None:
+            try: self.backend.close()
+            except Exception: pass
+        self.backend = make_backend(self.backend_name, self.model_path,
+                                    sensitivity=sensitivity)
+        self.backend.initialize(self.video_width, self.video_height, self.fps)
+        logger.info("Pose backend active: %s", self.backend.name)
 
         # Initialize storage
         self.frames = []
         self.landmarks_list = []
+        self.body_landmarks_list = []
+        self.face_landmarks_list = []
+        self.body_landmarks_list_all = []
+        self.face_landmarks_list_all = []
         self.gesture_history_left = []
         self.gesture_history_right = []
         self.gesture_counts.clear()
@@ -170,6 +218,25 @@ class VideoAnalysisEngine:
         current_chunk = 0
         sampled_frame_count = 0
 
+        # ETA tracking — rolling window of (wall_time, frame_index) samples so
+        # the estimate reflects recent throughput, not a cold-start average.
+        eta_samples = collections.deque(maxlen=10)
+        eta_samples.append((time.time(), 0))
+
+        def _eta_text() -> str:
+            """Estimate remaining analysis time from recent frame throughput."""
+            if total_frames <= 0 or len(eta_samples) < 2:
+                return ""
+            t_old, f_old = eta_samples[0]
+            t_new, f_new = eta_samples[-1]
+            dt = t_new - t_old
+            df = f_new - f_old
+            if dt <= 0 or df <= 0:
+                return ""
+            fps_proc = df / dt
+            remaining = (total_frames - f_new) / fps_proc
+            return f" — ETA {_format_duration(remaining)}"
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -181,24 +248,36 @@ class VideoAnalysisEngine:
                 sampled_frame_count += 1
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
             timestamp_ms = int(frame_index * 1000 / self.fps)
             try:
-                result = recognizer.recognize_for_video(mp_image, timestamp_ms)
+                result: FrameResult = self.backend.process_frame(rgb, timestamp_ms)
             except Exception as e:
                 logging.warning("Frame %d detection error: %s", frame_index, e)
                 frame_index += 1
+                # Still append a placeholder so list indices stay aligned with
+                # frame timestamps for downstream consumers.
+                self.landmarks_list.append([])
+                self.gesture_history_left.append(None)
+                self.gesture_history_right.append(None)
+                if self.backend.supports_body:
+                    self.body_landmarks_list.append(None)
+                    self.body_landmarks_list_all.append([])
+                if self.backend.supports_face:
+                    self.face_landmarks_list.append(None)
+                    self.face_landmarks_list_all.append([])
                 continue
 
             frame_index += 1
 
             # Progress updates
             if progress_callback and frame_index % 30 == 0:
+                eta_samples.append((time.time(), frame_index))
                 current_chunk = frame_index // frames_per_chunk
                 chunk_prog = (frame_index % frames_per_chunk) / frames_per_chunk
                 overall_percent = int((current_chunk / num_chunks) * 85 + (chunk_prog / num_chunks) * 85)
-                progress_callback(overall_percent, f"Processing chunk {current_chunk + 1}/{num_chunks} \n ({sampled_frame_count} frames stored)")
+                progress_callback(overall_percent,
+                                  f"Processing chunk {current_chunk + 1}/{num_chunks} "
+                                  f"({sampled_frame_count} frames stored){_eta_text()}")
 
             # Chunk boundary progress update
             if frame_index % frames_per_chunk == 0:
@@ -208,33 +287,35 @@ class VideoAnalysisEngine:
                                     f"Completed chunk {current_chunk}/{num_chunks} \n {sampled_frame_count} frames stored")
 
 
-            # Extract Data
-            gesture_left, gesture_right = None, None
-            frame_data = [] # List of (landmarks, label)
+            # Extract Data — backend already returned a normalized FrameResult.
+            # Shape matches the original (landmarks, label) tuples so all
+            # downstream code (regenerate_data, save/load, UI) is unchanged.
+            self.landmarks_list.append(result.hands)
+            self.gesture_history_left.append(result.gesture_left)
+            self.gesture_history_right.append(result.gesture_right)
 
-            if result.hand_landmarks:
-                for i, hand_landmarks in enumerate(result.hand_landmarks):
-                    label = result.handedness[i][0].category_name # "Left" or "Right"
-                    
-                    if result.gestures and len(result.gestures) > i:
-                        gesture = result.gestures[i][0]
-                        if label == "Left":
-                            gesture_left = (gesture.category_name, gesture.score)
-                        else:
-                            gesture_right = (gesture.category_name, gesture.score)
-                    
-                    frame_data.append((hand_landmarks, label))
-            
-            self.gesture_history_left.append(gesture_left)
-            self.gesture_history_right.append(gesture_right)
+            if result.gesture_left:
+                self.gesture_counts[f"Left_{result.gesture_left[0]}"] += 1
+            if result.gesture_right:
+                self.gesture_counts[f"Right_{result.gesture_right[0]}"] += 1
 
-            if gesture_left: self.gesture_counts[f"Left_{gesture_left[0]}"] += 1
-            if gesture_right: self.gesture_counts[f"Right_{gesture_right[0]}"] += 1
-
-            self.landmarks_list.append(frame_data)
+            # Whole-body backends populate body / face; MediaPipe leaves them None.
+            if self.backend.supports_body:
+                self.body_landmarks_list.append(result.body)
+                self.body_landmarks_list_all.append(result.body_per_person)
+            if self.backend.supports_face:
+                self.face_landmarks_list.append(result.face)
+                self.face_landmarks_list_all.append(result.face_per_person)
 
         cap.release()
-        
+        # Release backend resources (frees CUDA memory for the Whisper worker)
+        try:
+            self.backend.close()
+        except Exception as e:
+            logger.warning("Backend close failed: %s", e)
+        finally:
+            self.backend = None
+
         # Audio Step
         if enable_audio:
             if progress_callback: progress_callback(90, "Transcribing Audio...")
@@ -809,6 +890,15 @@ class VideoAnalysisEngine:
         self.trace_path_left = []
         self.trace_path_right = []
 
+        # Whole-body source → build heatmap/traces from body keypoints instead
+        # of hands, then fall through to the shared filter/speed/blur tail.
+        if source in BODY_HEATMAP_SOURCES:
+            self._regenerate_from_body(source)
+            self.trace_path_left = self.filter_trace(self.trace_path_left)
+            self.trace_path_right = self.filter_trace(self.trace_path_right)
+            self._finalize_heatmaps()
+            return
+
         for frame_data in self.landmarks_list:
             trace_l, trace_r = None, None
 
@@ -868,8 +958,10 @@ class VideoAnalysisEngine:
 
         self.trace_path_left = self.filter_trace(self.trace_path_left)
         self.trace_path_right = self.filter_trace(self.trace_path_right)
+        self._finalize_heatmaps()
 
-        # Speed Heatmap
+    def _finalize_heatmaps(self):
+        """Shared tail: build the speed heatmap from traces and blur both maps."""
         for path in [self.trace_path_left, self.trace_path_right]:
             for i in range(1, len(path)):
                 p_prev, p_curr = path[i-1], path[i]
@@ -885,6 +977,45 @@ class VideoAnalysisEngine:
             self.heatmap = cv2.GaussianBlur(self.heatmap, (HEATMAP_BLUR_KERNEL, HEATMAP_BLUR_KERNEL), 0)
         if np.max(self.speed_heatmap) > 0:
             self.speed_heatmap = cv2.GaussianBlur(self.speed_heatmap, (HEATMAP_BLUR_KERNEL, HEATMAP_BLUR_KERNEL), 0)
+
+    def _regenerate_from_body(self, source):
+        """
+        Build heatmap + L/R traces from whole-body (RTMW) keypoints.
+        Populates self.heatmap, self.trace_path_left, self.trace_path_right.
+        No-op-safe when body_landmarks_list is empty (e.g. MediaPipe backend).
+        """
+        hm_indices, left_idx, right_idx = BODY_HEATMAP_SOURCES[source]
+        W, H = self.video_width, self.video_height
+
+        def _vis(lm):
+            return getattr(lm, "visibility", 1.0)
+
+        for body_kps in self.body_landmarks_list:
+            trace_l, trace_r = None, None
+            if body_kps:
+                # Heatmap: bounding box over the visible region keypoints
+                pts = []
+                for i in hm_indices:
+                    if i < len(body_kps) and _vis(body_kps[i]) >= 0.3:
+                        pts.append((int(body_kps[i].x * W), int(body_kps[i].y * H)))
+                if pts:
+                    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                    min_x, max_x = max(0, min(xs)), min(W, max(xs))
+                    min_y, max_y = max(0, min(ys)), min(H, max(ys))
+                    if max_x == min_x: max_x += 1
+                    if max_y == min_y: max_y += 1
+                    self.heatmap[min_y:max_y, min_x:max_x] += 1
+
+                # Traces from the chosen left/right keypoints
+                if left_idx < len(body_kps) and _vis(body_kps[left_idx]) >= 0.3:
+                    lm = body_kps[left_idx]
+                    trace_l = (int(lm.x * W), int(lm.y * H), 1.0)
+                if right_idx < len(body_kps) and _vis(body_kps[right_idx]) >= 0.3:
+                    lm = body_kps[right_idx]
+                    trace_r = (int(lm.x * W), int(lm.y * H), 1.0)
+
+            self.trace_path_left.append(trace_l)
+            self.trace_path_right.append(trace_r)
 
     def calculate_metrics(self):
         metrics = {
@@ -1050,22 +1181,48 @@ class VideoAnalysisEngine:
             filepath = os.path.join(lib_dir, filename)
             
             # Serialize Landmarks (MediaPipe objects not picklable)
+            def _lm_dict(lm):
+                # Tolerant of both MediaPipe landmarks and pose_backends.Landmark
+                return {'x': lm.x, 'y': lm.y, 'z': getattr(lm, 'z', 0.0)}
+
             serializable_landmarks = []
             for frame_data in self.landmarks_list:
                 # frame_data is list of (landmarks, label)
                 s_frame = []
                 for lms, label in frame_data:
-                    # Convert NormalizedLandmarkList to list of dicts
-                    lms_data = [{'x': lm.x, 'y': lm.y, 'z': lm.z} for lm in lms]
-                    s_frame.append((lms_data, label))
+                    s_frame.append(([_lm_dict(lm) for lm in lms], label))
                 serializable_landmarks.append(s_frame)
-            
+
+            # Phase 1: body / face from whole-body backends.  Stored as lists
+            # of lists-of-dicts; each per-frame entry may be None.
+            def _serialize_kp_list(per_frame_list):
+                out = []
+                for kp in per_frame_list:
+                    if kp is None:
+                        out.append(None)
+                    else:
+                        out.append([_lm_dict(lm) for lm in kp])
+                return out
+
+            serializable_body = _serialize_kp_list(self.body_landmarks_list)
+            serializable_face = _serialize_kp_list(self.face_landmarks_list)
+
+            # v1.3: per-person body / face (RTMW multi-person).  Each frame is
+            # a list of per-person keypoint lists; empty list means "no people".
+            def _serialize_per_person(per_frame_list):
+                out = []
+                for people in (per_frame_list or []):
+                    out.append([[_lm_dict(lm) for lm in p] for p in people])
+                return out
+            serializable_body_all = _serialize_per_person(self.body_landmarks_list_all)
+            serializable_face_all = _serialize_per_person(self.face_landmarks_list_all)
+
             # Determine flags
             has_hands = len(self.landmarks_list) > 0
-            
+
             # Construct Data Payload
             data = {
-                'version': 1.1, # Bump version for has_hands support
+                'version': 1.3,  # 1.3 adds multi-person body/face keypoint lists
                 'timestamp': datetime.now().isoformat(),
                 'video_path': self.video_path,
                 'video_width': self.video_width,
@@ -1073,10 +1230,15 @@ class VideoAnalysisEngine:
                 'fps': self.fps,
                 'total_frames': self.total_frames,
                 'landmarks': serializable_landmarks,
+                'body_landmarks': serializable_body,
+                'face_landmarks': serializable_face,
+                'body_landmarks_all': serializable_body_all,
+                'face_landmarks_all': serializable_face_all,
                 'transcript': self.transcript,
                 'audio_summary': self.audio_summary,
                 'gesture_counts': dict(self.gesture_counts),
-                'has_hands': has_hands 
+                'has_hands': has_hands,
+                'backend': self.backend_name,
             }
             
             with open(filepath, 'wb') as f:
@@ -1121,7 +1283,7 @@ class VideoAnalysisEngine:
             # Saved as list of list of ( [{'x':...}, label] )
             # Need to convert back to objects with .x, .y attributes
             self.landmarks_list = []
-            
+
             raw_landmarks = data.get('landmarks', [])
             for frame_rows in raw_landmarks:
                 reconstructed_frame = []
@@ -1131,6 +1293,45 @@ class VideoAnalysisEngine:
                         lms_objs.append(LandmarkCompat(lm_dict['x'], lm_dict['y'], lm_dict['z']))
                     reconstructed_frame.append((lms_objs, label))
                 self.landmarks_list.append(reconstructed_frame)
+
+            # v1.2 additions — body / face keypoints from whole-body backends.
+            # Missing in older files → empty lists (downstream code treats them
+            # as optional).
+            def _deser_kp_list(raw):
+                out = []
+                for kp in (raw or []):
+                    if kp is None:
+                        out.append(None)
+                    else:
+                        out.append([LandmarkCompat(d['x'], d['y'], d.get('z', 0.0))
+                                    for d in kp])
+                return out
+            self.body_landmarks_list = _deser_kp_list(data.get('body_landmarks'))
+            self.face_landmarks_list = _deser_kp_list(data.get('face_landmarks'))
+
+            # v1.3 multi-person.  Missing in older files → derive single-person
+            # _all from the single-subject lists so the UI still iterates.
+            def _deser_per_person(raw):
+                out = []
+                for people in (raw or []):
+                    out.append([[LandmarkCompat(d['x'], d['y'], d.get('z', 0.0))
+                                 for d in p] for p in people])
+                return out
+            body_all_raw = data.get('body_landmarks_all')
+            face_all_raw = data.get('face_landmarks_all')
+            if body_all_raw is not None:
+                self.body_landmarks_list_all = _deser_per_person(body_all_raw)
+            else:
+                self.body_landmarks_list_all = [
+                    [kp] if kp else [] for kp in self.body_landmarks_list
+                ]
+            if face_all_raw is not None:
+                self.face_landmarks_list_all = _deser_per_person(face_all_raw)
+            else:
+                self.face_landmarks_list_all = [
+                    [kp] if kp else [] for kp in self.face_landmarks_list
+                ]
+            self.backend_name = data.get('backend', self.backend_name)
             
             # Set has_hands flag
             if explicit_has_hands is not None:

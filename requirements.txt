@@ -3,7 +3,11 @@ opencv-python>=4.8.0,<5.0
 mediapipe>=0.10.0,<0.12
 customtkinter>=5.2.0,<6.0
 Pillow>=10.0.0,<12.0
-numpy>=1.24.0,<3.0
+# numpy capped at <2.0 because xtcocotools 1.14.x (a transitive dep of
+# mmpose / RTMW) only ships wheels compiled against the numpy 1.x ABI.
+# Bumping to numpy 2.x → ValueError "numpy.dtype size changed".  Revisit
+# when xtcocotools publishes numpy-2-compatible wheels.
+numpy>=1.24.0,<2.0
 matplotlib>=3.7.0,<4.0
 
 # Data & Visualization
